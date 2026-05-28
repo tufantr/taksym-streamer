@@ -143,12 +143,16 @@ function ffmpegArgsForBatch() {
   const wordmark = ffmpegEscape(CFG.brandUrl);
   const tagline = ffmpegEscape("AI music streaming · 100+ genres");
 
+  // Subtle pulse on the wordmark gives x264 something to encode every
+  // frame — without motion, static lavfi color encodes at ~400 kbps which
+  // some platforms filter as "non-live". sin() oscillation @ ~0.5 Hz.
   const filter = [
     `[0:v]drawtext=text='${tagline}':fontfile=${CFG.fontFile}:` +
       `fontsize=44:fontcolor=white@0.85:` +
       `x=(w-text_w)/2:y=(h-text_h)/2[mid]`,
     `[mid]drawtext=text='${wordmark}':fontfile=${CFG.fontFile}:` +
       `fontsize=42:fontcolor=white:` +
+      `alpha='0.85+0.15*sin(2*PI*t/2)':` +
       `box=1:boxcolor=black@0.4:boxborderw=12:` +
       `x=32:y=H-th-32[v]`,
   ].join(";");
