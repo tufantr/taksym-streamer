@@ -1,0 +1,46 @@
+# Two services on one VPS:
+#   stream  — FFmpeg orchestrator (heavier process)
+#   bot     — chat bot (one-shot Node, no FFmpeg)
+#
+# They share state through a volume so the bot can read what the stream
+# is currently broadcasting. Both auto-restart on crash.
+
+services:
+  stream:
+    build: .
+    image: taksym-streamer:latest
+    container_name: taksym-stream
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      STATE_PATH: /state/stream-state.json
+    volumes:
+      - state:/state
+    # Modest resource ceilings for a 1 vCPU / 1 GB VPS — leaves room for
+    # the chat bot + system processes.
+    deploy:
+      resources:
+        limits:
+          cpus: "0.85"
+          memory: 700M
+
+  bot:
+    image: taksym-streamer:latest
+    container_name: taksym-bot
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      STATE_PATH: /state/stream-state.json
+    command: node chat-bot.mjs
+    volumes:
+      - state:/state
+    depends_on:
+      - stream
+    deploy:
+      resources:
+        limits:
+          cpus: "0.10"
+          memory: 200M
+
+volumes:
+  state:

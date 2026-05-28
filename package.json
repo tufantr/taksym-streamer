@@ -1,0 +1,17 @@
+{
+  "name": "taksym-streamer",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "description": "24/7 RTMP music streamer for taksym.com",
+  "scripts": {
+    "stream": "node stream.mjs",
+    "bot": "node chat-bot.mjs"
+  },
+  "dependencies": {
+    "qrcode": "^1.5.4",
+    "tmi.js": "^1.8.5",
+    "googleapis": "^144.0.0",
+    "ws": "^8.18.0"
+  }
+}

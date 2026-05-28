@@ -1,0 +1,7 @@
+.env
+.env.*
+!.env.example
+node_modules/
+flaggedTracks.txt
+*.log
+.DS_Store
