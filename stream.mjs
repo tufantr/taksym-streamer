@@ -1,27 +1,23 @@
 #!/usr/bin/env node
 //
-// Taksym 24/7 RTMP streamer.
+// Taksym 24/7 RTMP streamer. Iterates through the catalog, encodes each
+// track with FFmpeg, and pushes a single H.264/AAC stream simultaneously
+// to Twitch, YouTube, and Kick via the `tee` muxer.
 //
-// Architecture (v2 — built for platform "live" detection):
+// Designed for low-spec VPS hosts (1 vCPU / 1 GB RAM):
+//   • 720p30 ultrafast + `tune=stillimage` — H.264 loves looping covers
+//   • cover image cached on disk per track, not re-fetched
+//   • single encode → tee'd to 3 sinks → bandwidth is what it is, but
+//     CPU is paid once
 //
-//   Streaming platforms only show a channel as LIVE when they see a stable,
-//   continuous RTMP connection. Our first attempt re-spawned FFmpeg per
-//   track — Kick saw the stream "flapping" every 30s and never lit up.
+// Each track gets a fresh:
+//   • Ken-Burns zoom on its cover art
+//   • "taksym.com" wordmark bottom-left
+//   • Now-playing text bottom-center
+//   • QR code top-right linking to /track/<id> via /t for UTM
 //
-//   v2 uses ONE long-running FFmpeg per batch of ~25 minutes. Audio inputs
-//   are concatenated via the concat demuxer; one RTMP connection covers
-//   the whole batch. When the batch ends, we immediately spawn the next.
-//   Between-batch gap is ~1s — well inside Kick/Twitch's "drop tolerance".
-//
-//   Tradeoff vs v1: per-track cover art is replaced with one brand-mark
-//   background. Now-playing text still updates by writing each track's
-//   metadata to a sidecar file that FFmpeg's `drawtext reload=1` re-reads
-//   every frame.
-//
-// State (chat bot reads this for !song):
-//   `/state/stream-state.json` — { id, title, artist, deepLink, startedAt }
-// Now-playing overlay source:
-//   `/state/nowplaying.txt` — single line "Title — Artist"
+// State is mirrored to a JSON file (lib/state.mjs) so the chat bot can
+// read the current track for `!song` replies.
 
 import { spawn } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -30,10 +26,22 @@ import fs from "node:fs";
 
 import { loadCatalog, shuffle } from "./lib/catalog.mjs";
 import { writeState } from "./lib/state.mjs";
+import { makeQRPng, fetchCover, ffmpegEscape, TMP_DIR } from "./lib/overlay.mjs";
+
+// Catalog returns relative audio URLs (`/assets/audio/...`); FFmpeg needs
+// absolute. Anchor against the site origin.
+function absoluteAudioUrl(url) {
+  if (!url) return null;
+  if (/^https?:\/\//i.test(url)) return url;
+  const origin = process.env.SITE_ORIGIN ?? "https://www.taksym.com";
+  if (url.startsWith("/")) return `${origin}${url}`;
+  return `${origin}/${url}`;
+}
 
 // ─── config ──────────────────────────────────────────────────────────────
 
 const CFG = {
+  // Stream keys (required, at least one)
   twitchKey: process.env.TWITCH_STREAM_KEY ?? "",
   youtubeKey: process.env.YOUTUBE_STREAM_KEY ?? "",
   kickKey: process.env.KICK_STREAM_KEY ?? "",
@@ -49,27 +57,23 @@ const CFG = {
   // Brand
   brandUrl: process.env.BRAND_URL ?? "taksym.com",
   siteOrigin: process.env.SITE_ORIGIN ?? "https://www.taksym.com",
+
+  // Font for overlay text. Bundled with most Ubuntu installs; fall back
+  // to a system font if not present.
   fontFile:
     process.env.FONT_FILE ??
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
 
-  // Batching — how many tracks per FFmpeg invocation. 30 tracks at ~30s
-  // each ≈ 15 minutes per batch. Long enough for Kick to register us as
-  // a stable broadcaster; short enough that any FFmpeg-level corruption
-  // is bounded.
-  batchSize: Number(process.env.STREAM_BATCH_SIZE ?? 30),
-
-  // Optional blocklist (one track id per line) for DMCA / hand-flagged.
-  blocklistPath: process.env.BLOCKLIST_PATH ?? "/state/flaggedTracks.txt",
-
-  // Where to write nowplaying.txt + the concat playlist. Mounted as a
-  // docker volume in the compose file so the chat bot can read state.
-  statePath: process.env.STATE_PATH ?? "/state/stream-state.json",
-  npPath: process.env.NP_PATH ?? "/state/nowplaying.txt",
-  playlistPath: process.env.PLAYLIST_PATH ?? "/state/playlist.txt",
+  // Optional blocklist file (track IDs the stream should skip — e.g.
+  // after a DMCA flag). One id per line.
+  blocklistPath: process.env.BLOCKLIST_PATH ?? "./flaggedTracks.txt",
 };
 
-const kickIngest = process.env.KICK_RTMP_URL ?? "rtmps://fa723fc1b171.global-contribute.live-video.net/app";
+// Twitch + YouTube ingest URLs are stable and well-known. Kick uses a
+// per-account RTMP URL that's printed in the Stream URL & Key dashboard
+// page — pass it via KICK_RTMP_URL alongside KICK_STREAM_KEY.
+const kickIngest = process.env.KICK_RTMP_URL ?? "rtmps://fa723fc1b171.global-contribute.live-video.net:443/app";
+
 const sinks = [
   CFG.twitchKey && `rtmp://live.twitch.tv/app/${CFG.twitchKey}`,
   CFG.youtubeKey && `rtmp://a.rtmp.youtube.com/live2/${CFG.youtubeKey}`,
@@ -77,14 +81,11 @@ const sinks = [
 ].filter(Boolean);
 
 if (sinks.length === 0) {
-  console.error("No stream destinations configured");
+  console.error("No stream destinations configured. Set TWITCH_STREAM_KEY, YOUTUBE_STREAM_KEY, and/or KICK_STREAM_KEY.");
   process.exit(1);
 }
 
-console.log(`streamer v2 up · destinations: ${sinks.length} · ${CFG.width}x${CFG.height}@${CFG.fps} · batch=${CFG.batchSize}`);
-
-// Ensure state dir exists.
-fs.mkdirSync(path.dirname(CFG.statePath), { recursive: true });
+console.log(`streamer up · destinations: ${sinks.length} · ${CFG.width}x${CFG.height}@${CFG.fps}`);
 
 // ─── helpers ─────────────────────────────────────────────────────────────
 
@@ -101,98 +102,55 @@ function loadBlocklist() {
   }
 }
 
-function absUrl(url) {
-  if (!url) return null;
-  if (/^https?:\/\//i.test(url)) return url;
-  if (url.startsWith("/")) return `${CFG.siteOrigin}${url}`;
-  return `${CFG.siteOrigin}/${url}`;
-}
-
-function getArtist(track) {
-  return (track.vibe_description ?? "").split(" by ")[1]?.replace(".", "") ?? "Unknown";
-}
-
-// Write the concat playlist FFmpeg will read. The concat demuxer accepts
-// remote http(s) URLs when `-safe 0` is set.
-function writePlaylist(tracks) {
-  const lines = [];
-  for (const t of tracks) {
-    const a = absUrl(t.audio_url);
-    if (!a) continue;
-    // Single-quote-escape filenames in concat list. Internal apostrophes
-    // are written as '\'' per ffmpeg docs.
-    const escaped = a.replace(/'/g, "'\\''");
-    lines.push(`file '${escaped}'`);
-  }
-  fs.writeFileSync(CFG.playlistPath, lines.join("\n") + "\n");
-}
-
-function ffmpegEscape(s) {
-  return String(s)
-    .replace(/\\/g, "\\\\")
-    .replace(/:/g, "\\:")
-    .replace(/'/g, "\\'")
-    .replace(/%/g, "\\%");
-}
-
-// Build the FFmpeg argv. One process, many tracks, one RTMP push to each
-// sink via the `tee` muxer.
-function ffmpegArgsForBatch() {
+function ffmpegArgsForTrack({ audioUrl, coverPath, qrPath, title, artist }) {
+  // Build the `tee` muxer destinations string. flvflags=no_duration_filesize
+  // is required for FLV streaming so RTMP doesn't try to seek.
   const teeDest = sinks
     .map((s) => `[f=flv:flvflags=no_duration_filesize:onfail=ignore]${s}`)
     .join("|");
 
-  const fontFile = CFG.fontFile;
+  // FFmpeg drawtext params — escape user-controlled strings.
   const wordmark = ffmpegEscape(CFG.brandUrl);
+  const nowPlaying = ffmpegEscape(`Now playing: ${title} — ${artist}`);
+  const fontFile = CFG.fontFile;
 
   // Filter graph:
-  //   [0:v]  brand background → scale to stream size, slow Ken-Burns zoom
-  //   drawtext wordmark bottom-left
-  //   drawtext now-playing bottom-center, reload=1 picks up file changes
-  //     between frames (so when we rewrite nowplaying.txt the overlay
-  //     updates automatically at the next frame).
+  //   [0:v]  cover image (looped) → scale + Ken-Burns zoompan → label [bg]
+  //   [1:v]  QR PNG → scale → label [qr]
+  //   [bg][qr] overlay (top-right corner) → drawtext wordmark + nowplaying
+  //
+  // The zoompan filter slowly zooms in over 30s (900 frames at 30fps),
+  // then resets — creates "alive" feel without burning CPU on real motion.
   const filter = [
+    // Background: loop the cover at the stream resolution, slow zoom.
     `[0:v]scale=${CFG.width * 1.2}:${CFG.height * 1.2}:force_original_aspect_ratio=increase,` +
       `crop=${CFG.width}:${CFG.height},` +
-      `zoompan=z='min(zoom+0.0004,1.10)':d=1:s=${CFG.width}x${CFG.height}:fps=${CFG.fps}[bg]`,
-    `[bg]drawtext=text='${wordmark}':fontfile=${fontFile}:` +
+      `zoompan=z='min(zoom+0.0008,1.15)':d=1:s=${CFG.width}x${CFG.height}:fps=${CFG.fps}[bg]`,
+    // QR code: scale to 220px square.
+    `[1:v]scale=220:220[qr]`,
+    // Layer QR onto background top-right with 32px margin.
+    `[bg][qr]overlay=W-w-32:32[bgqr]`,
+    // Brand wordmark bottom-left.
+    `[bgqr]drawtext=text='${wordmark}':fontfile=${fontFile}:` +
       `fontsize=42:fontcolor=white:` +
       `box=1:boxcolor=black@0.35:boxborderw=10:` +
       `x=32:y=H-th-32[wm]`,
-    `[wm]drawtext=textfile=${CFG.npPath}:reload=1:fontfile=${fontFile}:` +
+    // Now-playing strip bottom-center.
+    `[wm]drawtext=text='${nowPlaying}':fontfile=${fontFile}:` +
       `fontsize=28:fontcolor=white:` +
       `box=1:boxcolor=black@0.55:boxborderw=14:` +
       `x=(w-text_w)/2:y=H-th-110[v]`,
   ].join(";");
 
-  // Brand background image lives in the image bundled with the streamer
-  // repo (an Apple-icon style mark we ship in `/app/brand.png`). Falls
-  // back to a solid color if the file is missing.
-  const brandImg = fs.existsSync("/app/brand.png") ? "/app/brand.png" : null;
-
-  const args = [
+  return [
     "-hide_banner",
     "-loglevel", "warning",
-    "-re",
-  ];
-
-  if (brandImg) {
-    args.push("-loop", "1", "-i", brandImg);
-  } else {
-    // Synthesised gradient as fallback.
-    args.push("-f", "lavfi", "-i", `color=c=#0a0d1a:s=${CFG.width}x${CFG.height}:r=${CFG.fps}`);
-  }
-
-  args.push(
-    "-f", "concat",
-    "-safe", "0",
-    "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
-    "-i", CFG.playlistPath,
-
+    "-re", // read input at native rate so the stream doesn't sprint ahead
+    "-loop", "1", "-i", coverPath, // [0] cover image
+    "-i", qrPath,                  // [1] QR code
+    "-i", audioUrl,                // [2] audio
     "-filter_complex", filter,
-    "-map", "[v]",
-    "-map", "1:a",
-
+    "-map", "[v]", "-map", "2:a",
     "-c:v", "libx264",
     "-preset", CFG.preset,
     "-tune", "stillimage",
@@ -202,82 +160,63 @@ function ffmpegArgsForBatch() {
     "-b:v", CFG.videoBitrate,
     "-maxrate", CFG.videoBitrate,
     "-bufsize", `${parseInt(CFG.videoBitrate) * 2}k`,
-
     "-c:a", "aac",
     "-b:a", CFG.audioBitrate,
     "-ar", "44100",
     "-ac", "2",
-
-    // The video input (looped image) is infinite. The audio input
-    // (concat list) is finite. `-shortest` stops at audio end — i.e.
-    // when the batch playlist finishes.
+    // Stop encoding when the audio input ends — otherwise the looped
+    // cover image would broadcast silence forever.
     "-shortest",
-
     "-f", "tee",
     teeDest,
-  );
-
-  return args;
+  ];
 }
 
-// ─── orchestration ─────────────────────────────────────────────────────
+// ─── main loop ───────────────────────────────────────────────────────────
 
 let stopping = false;
-let current = null;
+let current = null; // child process
 
 process.on("SIGTERM", () => { stopping = true; current?.kill("SIGTERM"); });
 process.on("SIGINT",  () => { stopping = true; current?.kill("SIGINT");  });
 
-// Update the now-playing overlay + state file. Called by the timer that
-// runs alongside the FFmpeg batch — Node knows each track's duration so
-// it can drive the overlay in sync with the audio.
-function setNowPlaying(track) {
-  if (!track) return;
+async function streamTrack(track) {
+  const id = track.id_key;
   const title = track.title ?? "Unknown";
-  const artist = getArtist(track);
-  fs.writeFileSync(CFG.npPath, `Now playing: ${title} — ${artist}\n`);
+  const artist = (track.vibe_description ?? "").split(" by ")[1]?.replace(".", "") ?? "Unknown";
+
+  // Per-track deep link → `/t?to=/track/<id>` redirects with UTM.
+  const deepLink = `${CFG.siteOrigin}/t?to=${encodeURIComponent(`/track/${encodeURIComponent(id)}`)}`;
+
+  // Prepare overlay assets.
+  const [coverPath, qrPath] = await Promise.all([
+    fetchCover(track.image_url || track.coverSrc, id),
+    makeQRPng(deepLink, id),
+  ]);
+
+  const audioUrl = absoluteAudioUrl(track.audio_url);
+  if (!audioUrl) throw new Error(`track ${id} has no audio url`);
+
+  // Mirror current track to disk so the chat bot can read it.
   writeState({
-    id: track.id_key,
-    title,
-    artist,
-    deepLink: `${CFG.siteOrigin}/t?to=${encodeURIComponent(`/track/${encodeURIComponent(track.id_key)}`)}`,
+    id, title, artist, deepLink,
     startedAt: Date.now(),
+    audioUrl,
   });
-}
 
-// Parse "M:SS" durations from the catalog into seconds. Defaults to 30s
-// when the catalog doesn't have a duration (avoids over-running the
-// overlay; FFmpeg will sync to the actual file).
-function durationSeconds(track) {
-  const m = (track.duration ?? "").match(/^(\d+):(\d+)$/);
-  if (!m) return 30;
-  return Number(m[1]) * 60 + Number(m[2]);
-}
-
-async function runBatch(tracks) {
-  writePlaylist(tracks);
-  // Seed the overlay with the first track and schedule transitions for
-  // subsequent ones using their cumulative offsets.
-  setNowPlaying(tracks[0]);
-  let elapsed = 0;
-  const timers = [];
-  for (let i = 0; i < tracks.length - 1; i++) {
-    elapsed += durationSeconds(tracks[i]);
-    const next = tracks[i + 1];
-    const t = setTimeout(() => setNowPlaying(next), elapsed * 1000);
-    timers.push(t);
-  }
-
-  console.log(`▶ batch · ${tracks.length} tracks · est ${Math.round(tracks.reduce((s, t) => s + durationSeconds(t), 0) / 60)}min`);
+  console.log(`▶ ${title} — ${artist} (${id})`);
 
   return new Promise((resolve) => {
-    current = spawn("ffmpeg", ffmpegArgsForBatch(), {
-      stdio: ["ignore", "inherit", "inherit"],
+    const args = ffmpegArgsForTrack({
+      audioUrl,
+      coverPath, qrPath, title, artist,
     });
+    current = spawn("ffmpeg", args, { stdio: ["ignore", "inherit", "inherit"] });
     current.on("exit", (code, signal) => {
-      timers.forEach(clearTimeout);
       current = null;
-      console.log(`  ↳ batch ended (code=${code} signal=${signal ?? "-"})`);
+      if (signal) console.log(`  ↳ killed (${signal})`);
+      else if (code === 0) console.log(`  ↳ done`);
+      else console.log(`  ↳ exit ${code}`);
       resolve(code);
     });
   });
@@ -289,26 +228,24 @@ async function main() {
     try {
       catalog = await loadCatalog();
     } catch (err) {
-      console.error("catalog load failed, retry 30s:", err.message);
+      console.error("catalog load failed, retrying in 30s:", err.message);
       await sleep(30_000);
       continue;
     }
     const blocklist = loadBlocklist();
-    const pool = shuffle(catalog).filter((t) => !blocklist.has(t.id_key) && t.audio_url);
-    if (pool.length === 0) {
-      console.error("no playable tracks — sleep 60s");
+    const queue = shuffle(catalog).filter((t) => !blocklist.has(t.id_key));
+    if (queue.length === 0) {
+      console.error("no playable tracks — sleeping 60s");
       await sleep(60_000);
       continue;
     }
-    // Slice into batches of CFG.batchSize and stream each as one FFmpeg
-    // session. RTMP stays connected for the whole batch.
-    for (let i = 0; i < pool.length && !stopping; i += CFG.batchSize) {
-      const batch = pool.slice(i, i + CFG.batchSize);
+    for (const track of queue) {
+      if (stopping) break;
       try {
-        await runBatch(batch);
+        await streamTrack(track);
       } catch (err) {
-        console.error("batch error:", err.message);
-        await sleep(3_000);
+        console.error(`track failed: ${err.message} — skipping`);
+        await sleep(2_000);
       }
     }
   }
