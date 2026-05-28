@@ -28,6 +28,18 @@ import { loadCatalog, shuffle } from "./lib/catalog.mjs";
 import { writeState } from "./lib/state.mjs";
 import { makeQRPng, fetchCover, ffmpegEscape, TMP_DIR } from "./lib/overlay.mjs";
 
+// Catalog audio_url is sometimes relative (`/assets/audio/foo.mp3`) — the
+// browser resolves these against the origin, but FFmpeg treats relative
+// paths as local files. Anchor against the site origin so FFmpeg gets an
+// HTTPS URL it can stream from.
+function absoluteAudioUrl(url) {
+  if (!url) return null;
+  if (/^https?:\/\//i.test(url)) return url;
+  const origin = process.env.SITE_ORIGIN ?? "https://www.taksym.com";
+  if (url.startsWith("/")) return `${origin}${url}`;
+  return `${origin}/${url}`;
+}
+
 // ─── config ──────────────────────────────────────────────────────────────
 
 const CFG = {
@@ -184,18 +196,21 @@ async function streamTrack(track) {
     makeQRPng(deepLink, id),
   ]);
 
+  const audioUrl = absoluteAudioUrl(track.audio_url);
+  if (!audioUrl) throw new Error(`track ${id} has no audio url`);
+
   // Mirror current track to disk so the chat bot can read it.
   writeState({
     id, title, artist, deepLink,
     startedAt: Date.now(),
-    audioUrl: track.audio_url,
+    audioUrl,
   });
 
   console.log(`▶ ${title} — ${artist} (${id})`);
 
   return new Promise((resolve) => {
     const args = ffmpegArgsForTrack({
-      audioUrl: track.audio_url,
+      audioUrl,
       coverPath, qrPath, title, artist,
     });
     current = spawn("ffmpeg", args, { stdio: ["ignore", "inherit", "inherit"] });
